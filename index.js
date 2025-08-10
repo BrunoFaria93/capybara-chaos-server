@@ -36,10 +36,12 @@ const scenarios = [
 ];
 
 io.on("connection", (socket) => {
-  console.log("conn:", socket.id);
+  console.log("🔌 Conexão estabelecida:", socket.id);
 
-  // Criar sala (mantendo sua lógica original)
+  // Criar sala
   socket.on("createRoom", ({ roomId, name }, cb) => {
+    console.log(`🏠 Criando sala: ${roomId} por ${name}`);
+
     if (rooms[roomId]) return cb({ ok: false, error: "room_exists" });
 
     rooms[roomId] = {
@@ -69,12 +71,44 @@ io.on("connection", (socket) => {
       points: 0,
     };
 
-    io.to(roomId).emit("roomUpdate", rooms[roomId]);
+    console.log(`✅ Sala ${roomId} criada. Host: ${socket.id}`);
+
+    // SEMPRE enviar roomUpdate após qualquer mudança
+    io.to(roomId).emit("roomUpdate", {
+      ...rooms[roomId],
+      players: rooms[roomId].players,
+      phase: rooms[roomId].phase,
+    });
+
     cb({ ok: true });
   });
+  socket.on("requestRoomUpdate", ({ roomId }, cb) => {
+    console.log(
+      `📡 Jogador ${socket.id} solicitou atualização da sala ${roomId}`
+    );
+    const room = rooms[roomId];
+    if (!room) {
+      console.log(`❌ Sala ${roomId} não encontrada`);
+      return cb({ ok: false, error: "no_room" });
+    }
 
-  // Entrar na sala (mantendo sua lógica original + melhorias)
+    cb({
+      ok: true,
+      room: {
+        ...room,
+        players: room.players,
+        phase: room.phase,
+        scenario: room.scenario,
+        obstacles: room.obstacles,
+        host: room.host,
+      },
+    });
+  });
+  // Entrar na sala
   socket.on("joinRoom", ({ roomId, name }, cb) => {
+    console.log(
+      `🚪 Jogador ${name} tentando entrar na sala ${roomId} com socket ${socket.id}`
+    );
     const room = rooms[roomId];
     if (!room) return cb({ ok: false, error: "no_room" });
 
@@ -89,65 +123,188 @@ io.on("connection", (socket) => {
       points: 0,
     };
 
-    io.to(roomId).emit("roomUpdate", room);
-    cb({ ok: true, room: room });
+    console.log(
+      `✅ Jogador ${name} entrou na sala ${roomId}. Total jogadores: ${
+        Object.keys(room.players).length
+      }`
+    );
+    io.in(roomId)
+      .allSockets()
+      .then((sockets) => {
+        console.log(
+          `📡 Sockets na sala ${roomId} após join:`,
+          Array.from(sockets)
+        );
+      });
+
+    io.to(roomId).emit("roomUpdate", {
+      ...room,
+      players: room.players,
+      phase: room.phase,
+    });
+
+    cb({ ok: true, room });
   });
 
-  // Sair da sala (mantendo sua lógica original)
+  // Sair da sala
   socket.on("leaveRoom", ({ roomId }) => {
+    console.log(`🚪 Jogador saindo da sala: ${roomId}`);
     const room = rooms[roomId];
     if (!room) return;
+
     delete room.players[socket.id];
     socket.leave(roomId);
-    if (Object.keys(room.players).length === 0) delete rooms[roomId];
-    else io.to(roomId).emit("roomUpdate", room);
-  });
 
-  // NOVAS FUNCIONALIDADES
+    if (Object.keys(room.players).length === 0) {
+      delete rooms[roomId];
+      console.log(`🗑️ Sala ${roomId} removida (vazia)`);
+    } else {
+      // Se era o host, transferir para outro jogador
+      if (room.host === socket.id) {
+        const remainingPlayers = Object.keys(room.players);
+        if (remainingPlayers.length > 0) {
+          room.host = remainingPlayers[0];
+          console.log(`👑 Novo host da sala ${roomId}: ${room.host}`);
+        }
+      }
+
+      io.to(roomId).emit("roomUpdate", {
+        ...room,
+        players: room.players,
+        phase: room.phase,
+      });
+    }
+  });
 
   // Iniciar seleção de cenário
   socket.on("startScenarioSelection", ({ roomId }) => {
+    console.log(
+      `🎯 Iniciando seleção de cenário na sala ${roomId} por ${socket.id}`
+    );
     const room = rooms[roomId];
     if (!room) return;
 
     // Apenas o host pode iniciar
-    if (room.host !== socket.id) return;
+    if (room.host !== socket.id) {
+      console.log(
+        `❌ Tentativa negada: ${socket.id} não é o host (${room.host})`
+      );
+      return;
+    }
 
     room.phase = "selecting";
+
+    // Emitir AMBOS os eventos para garantir compatibilidade
     io.to(roomId).emit("scenarioSelection");
-    console.log(`Seleção de cenário iniciada na sala ${roomId}`);
+    io.to(roomId).emit("roomUpdate", {
+      ...room,
+      players: room.players,
+      phase: room.phase,
+    });
+
+    console.log(`✅ Seleção de cenário iniciada na sala ${roomId}`);
   });
 
   // Selecionar cenário
   socket.on("selectScenario", ({ roomId, scenario }) => {
+    console.log(
+      `🌍 Cenário selecionado: ${scenario.name} na sala ${roomId} por ${socket.id}`
+    );
     const room = rooms[roomId];
     if (!room || room.phase !== "selecting") return;
 
     room.scenario = scenario;
     room.phase = "building";
-    room.obstacles = []; // limpar obstáculos anteriores
+    room.obstacles = [];
 
+    console.log(`🏠 Atualizando sala ${roomId} para fase building`);
     io.to(roomId).emit("buildingPhase", { scenario });
-    console.log(`Cenário selecionado: ${scenario.name} na sala ${roomId}`);
+    io.to(roomId).emit("roomUpdate", {
+      ...room,
+      players: room.players,
+      phase: room.phase,
+      scenario: room.scenario,
+    });
   });
 
-  // Colocar obstáculo (melhorado)
+  // Iniciar round (ESTE É O EVENTO CHAVE QUE ESTAVA FALTANDO SINCRONIZAÇÃO)
+  socket.on("startRound", ({ roomId }) => {
+    console.log(`🚀 Iniciando round na sala ${roomId} por ${socket.id}`);
+    const room = rooms[roomId];
+    if (!room || room.phase !== "building") return;
+
+    if (room.host !== socket.id) {
+      console.log(
+        `❌ Tentativa negada: ${socket.id} não é o host (${room.host})`
+      );
+      return;
+    }
+
+    room.phase = "itemSelection";
+    room.takenItems = new Set();
+    room.placedItems = new Set();
+    room.deadPlayers = new Set();
+    room.reachedFlagPlayers = new Set();
+    room.projectiles = [];
+
+    const groundY = room.scenario?.groundY || 150;
+    const screenHeight = 800;
+    const screenWidth = 400;
+
+    Object.values(room.players).forEach((player, index) => {
+      player.x =
+        (screenWidth / (Object.keys(room.players).length + 1)) * (index + 1);
+      player.y = screenHeight - groundY - 50;
+    });
+
+    console.log(
+      `📤 Enviando roundStarted para sala ${roomId} com ${
+        Object.keys(room.players).length
+      } jogadores`
+    );
+    // Log para verificar sockets na sala
+    io.in(roomId)
+      .allSockets()
+      .then((sockets) => {
+        console.log(`📡 Sockets na sala ${roomId}:`, Array.from(sockets));
+      });
+
+    io.to(roomId).emit("roundStarted", {
+      obstacles: room.obstacles,
+      scenario: room.scenario,
+      players: room.players,
+    });
+
+    io.to(roomId).emit("roomUpdate", {
+      ...room,
+      players: room.players,
+      phase: room.phase,
+    });
+
+    console.log(
+      `✅ Round iniciado na sala ${roomId} com ${room.obstacles.length} obstáculos`
+    );
+
+    setInterval(() => updateProjectiles(roomId), 100);
+  });
+
+  // Colocar obstáculo
   socket.on("placeObstacle", ({ roomId, obstacle }, cb) => {
+    console.log(`🔧 Colocando obstáculo ${obstacle.type} na sala ${roomId}`);
     const room = rooms[roomId];
     if (!room) return cb && cb({ ok: false, error: "no_room" });
     if (room.phase !== "building")
       return cb && cb({ ok: false, error: "wrong_phase" });
 
-    // Verificar se posição é válida (não muito próxima de outros obstáculos)
+    // Verificações de posição
     const isValidPosition = !room.obstacles.some(
       (existing) =>
         Math.abs(existing.x - obstacle.x) < 50 &&
         Math.abs(existing.y - obstacle.y) < 50
     );
 
-    // Verificar se não está muito próximo do chão
     const groundY = room.scenario?.groundY || 150;
-    const screenHeight = 800; // assumindo altura padrão
+    const screenHeight = 800;
     if (obstacle.y > screenHeight - groundY - 50) {
       return cb && cb({ ok: false, error: "too_close_to_ground" });
     }
@@ -160,126 +317,67 @@ io.on("connection", (socket) => {
       };
       room.obstacles.push(newObs);
 
-      // Usar o novo evento específico para obstáculos
       io.to(roomId).emit("obstacleAdded", newObs);
-      io.to(roomId).emit("obstaclesUpdate", room.obstacles); // manter compatibilidade
-
       cb && cb({ ok: true });
-      console.log(`Obstáculo ${obstacle.type} adicionado na sala ${roomId}`);
+      console.log(`✅ Obstáculo ${obstacle.type} adicionado na sala ${roomId}`);
     } else {
       cb && cb({ ok: false, error: "invalid_position" });
     }
   });
 
-  // Remover obstáculo
-  socket.on("removeObstacle", ({ roomId, obstacleId }) => {
-    const room = rooms[roomId];
-    if (!room || room.phase !== "building") return;
-
-    const obstacleIndex = room.obstacles.findIndex(
-      (obs) => obs.id === obstacleId && obs.ownerId === socket.id
-    );
-
-    if (obstacleIndex !== -1) {
-      room.obstacles.splice(obstacleIndex, 1);
-      io.to(roomId).emit("obstacleRemoved", { obstacleId });
-      io.to(roomId).emit("obstaclesUpdate", room.obstacles);
-    }
-  });
-
-  // Atualização de jogador (mantendo sua lógica + melhorias)
-  socket.on("playerUpdate", ({ roomId, x, y }) => {
-    const room = rooms[roomId];
-    if (!room) return;
-    if (room.players[socket.id]) {
-      room.players[socket.id].x = x;
-      room.players[socket.id].y = y;
-
-      // Emitir com dados completos do jogador
-      const playerData = {
-        id: socket.id,
-        name: room.players[socket.id].name,
-        x,
-        y,
-        character: room.players[socket.id].character,
-      };
-
-      socket.to(roomId).emit("playerMoved", playerData);
-    }
-  });
-
-  // Iniciar round
-  socket.on("startRound", ({ roomId }) => {
-    const room = rooms[roomId];
-    if (!room || room.phase !== "building") return;
-
-    // Apenas o host pode iniciar
-    if (room.host !== socket.id) return;
-
-    room.phase = "itemSelection";
-    room.takenItems = new Set();
-    room.placedItems = new Set();
-    room.deadPlayers = new Set();
-    room.reachedFlagPlayers = new Set();
-    room.projectiles = [];
-
-    // Reset posições dos jogadores para o chão
-    const groundY = room.scenario?.groundY || 150;
-    const screenHeight = 800;
-    const screenWidth = 400;
-
-    Object.values(room.players).forEach((player, index) => {
-      player.x =
-        (screenWidth / (Object.keys(room.players).length + 1)) * (index + 1);
-      player.y = screenHeight - groundY - 50; // um pouco acima do chão
-    });
-
-    console.log(
-      `Emitindo roundStarted para a sala ${roomId} com ${
-        Object.keys(room.players).length
-      } jogadores`
-    );
-    io.to(roomId).emit("roundStarted", {
-      obstacles: room.obstacles,
-      scenario: room.scenario,
-      players: room.players,
-    });
-
-    console.log(
-      `Round iniciado na sala ${roomId} com ${room.obstacles.length} obstáculos`
-    );
-
-    // Start projectile simulation
-    setInterval(() => updateProjectiles(roomId), 100);
-  });
-
   // Selecionar item
   socket.on("selectItem", ({ roomId, itemType }, cb) => {
+    console.log(
+      `🎯 Jogador ${socket.id} selecionando item ${itemType} na sala ${roomId}`
+    );
     const room = rooms[roomId];
-    if (!room || room.phase !== "itemSelection") return cb({ ok: false });
+    if (!room || room.phase !== "itemSelection") {
+      console.log(`❌ Fase incorreta: ${room?.phase}`);
+      return cb({ ok: false });
+    }
 
-    if (room.takenItems.has(itemType)) return cb({ ok: false });
+    if (room.takenItems.has(itemType)) {
+      console.log(`❌ Item ${itemType} já foi pego`);
+      return cb({ ok: false });
+    }
 
     room.takenItems.add(itemType);
     io.to(roomId).emit("itemTaken", { itemType });
     cb({ ok: true });
+    console.log(`✅ Item ${itemType} selecionado na sala ${roomId}`);
   });
 
   // Item colocado
   socket.on("itemPlaced", ({ roomId }) => {
+    console.log(`📍 Item colocado pelo jogador ${socket.id} na sala ${roomId}`);
     const room = rooms[roomId];
-    if (!room || room.phase !== "itemSelection") return;
+    if (!room) return;
 
     room.placedItems.add(socket.id);
+    console.log(
+      `📊 Items colocados: ${room.placedItems.size}/${
+        Object.keys(room.players).length
+      }`
+    );
+
     if (room.placedItems.size === Object.keys(room.players).length) {
       room.phase = "playing";
       io.to(roomId).emit("startPlaying");
+      io.to(roomId).emit("roomUpdate", {
+        ...room,
+        players: room.players,
+        phase: room.phase,
+      });
       startRoundTimer(roomId);
+      console.log(`🎮 Iniciando gameplay na sala ${roomId}`);
     }
   });
 
   // Skip item selection
   socket.on("skipItemSelection", ({ roomId }) => {
+    console.log(
+      `⏭️ Jogador ${socket.id} pulou seleção de item na sala ${roomId}`
+    );
     const room = rooms[roomId];
     if (!room || room.phase !== "itemSelection") return;
 
@@ -287,12 +385,38 @@ io.on("connection", (socket) => {
     if (room.placedItems.size === Object.keys(room.players).length) {
       room.phase = "playing";
       io.to(roomId).emit("startPlaying");
+      io.to(roomId).emit("roomUpdate", {
+        ...room,
+        players: room.players,
+        phase: room.phase,
+      });
       startRoundTimer(roomId);
+      console.log(`🎮 Iniciando gameplay na sala ${roomId} (todos pularam)`);
     }
+  });
+
+  // Atualização de jogador
+  socket.on("playerUpdate", ({ roomId, x, y }) => {
+    const room = rooms[roomId];
+    if (!room || !room.players[socket.id]) return;
+
+    room.players[socket.id].x = x;
+    room.players[socket.id].y = y;
+
+    const playerData = {
+      id: socket.id,
+      name: room.players[socket.id].name,
+      x,
+      y,
+      character: room.players[socket.id].character,
+    };
+
+    socket.to(roomId).emit("playerMoved", playerData);
   });
 
   // Player died
   socket.on("playerDied", ({ roomId }) => {
+    console.log(`💀 Jogador ${socket.id} morreu na sala ${roomId}`);
     const room = rooms[roomId];
     if (!room || room.phase !== "playing") return;
 
@@ -302,6 +426,7 @@ io.on("connection", (socket) => {
 
   // Reached flag
   socket.on("reachedFlag", ({ roomId }) => {
+    console.log(`🏁 Jogador ${socket.id} chegou na bandeira na sala ${roomId}`);
     const room = rooms[roomId];
     if (!room || room.phase !== "playing") return;
 
@@ -309,101 +434,9 @@ io.on("connection", (socket) => {
     checkRoundEnd(roomId);
   });
 
-  // Verificar colisões
-  socket.on("checkCollision", ({ roomId, playerId }) => {
-    const room = rooms[roomId];
-    if (!room || room.phase !== "playing") return;
-
-    const player = room.players[playerId || socket.id];
-    if (!player) return;
-
-    // Verificar colisão com obstáculos
-    const collision = room.obstacles.find(
-      (obstacle) =>
-        player.x < obstacle.x + obstacle.width &&
-        player.x + 30 > obstacle.x &&
-        player.y < obstacle.y + obstacle.height &&
-        player.y + 30 > obstacle.y
-    );
-
-    if (collision) {
-      // Emitir evento de colisão com efeito baseado no tipo
-      const effects = {
-        spike: { type: "damage", value: 1 },
-        spring: { type: "bounce", value: 50 },
-        hammer: { type: "knock", direction: "random" },
-        saw: { type: "damage", value: 2 },
-        cannon: { type: "explosion", radius: 100 },
-        platform: { type: "none" },
-      };
-
-      socket.emit("collision", {
-        obstacleType: collision.type,
-        effect: effects[collision.type] || { type: "none" },
-      });
-
-      console.log(`Colisão: ${player.name} com ${collision.type}`);
-    }
-  });
-
-  // Alterar personagem
-  socket.on("changeCharacter", ({ roomId, character }) => {
-    const room = rooms[roomId];
-    if (!room || !room.players[socket.id]) return;
-
-    room.players[socket.id].character = character;
-    io.to(roomId).emit("playerCharacterChanged", {
-      playerId: socket.id,
-      character: character,
-    });
-  });
-
-  // Estado da sala
-  socket.on("getRoomState", ({ roomId }) => {
-    const room = rooms[roomId];
-    if (!room) return;
-
-    socket.emit("roomState", {
-      players: room.players,
-      obstacles: room.obstacles,
-      scenario: room.scenario,
-      phase: room.phase,
-      host: room.host,
-    });
-  });
-
-  // Resetar sala
-  socket.on("resetRoom", ({ roomId }) => {
-    const room = rooms[roomId];
-    if (!room) return;
-
-    // Apenas o host pode resetar
-    if (room.host !== socket.id) return;
-
-    room.obstacles = [];
-    room.scenario = null;
-    room.phase = "waiting";
-
-    // Reset ready status
-    Object.values(room.players).forEach((player) => {
-      player.ready = false;
-      player.x = 0;
-      player.y = 0;
-    });
-
-    io.to(roomId).emit("roomReset");
-    io.to(roomId).emit("roomUpdate", room);
-    console.log(`Sala ${roomId} resetada`);
-  });
-
-  // Obter cenários disponíveis
-  socket.on("getScenarios", () => {
-    socket.emit("scenarioList", scenarios);
-  });
-
-  // Desconexão (melhorado)
+  // Desconexão
   socket.on("disconnect", () => {
-    console.log("dc:", socket.id);
+    console.log("❌ Desconexão:", socket.id);
     for (const roomId of Object.keys(rooms)) {
       const room = rooms[roomId];
       if (room.players[socket.id]) {
@@ -414,16 +447,19 @@ io.on("connection", (socket) => {
           const remainingPlayers = Object.keys(room.players);
           if (remainingPlayers.length > 0) {
             room.host = remainingPlayers[0];
-            io.to(roomId).emit("newHost", { hostId: room.host });
+            console.log(`👑 Novo host da sala ${roomId}: ${room.host}`);
           }
         }
 
-        io.to(roomId).emit("roomUpdate", room);
-        io.to(roomId).emit("playerLeft", { id: socket.id });
+        io.to(roomId).emit("roomUpdate", {
+          ...room,
+          players: room.players,
+          phase: room.phase,
+        });
 
         if (Object.keys(room.players).length === 0) {
           delete rooms[roomId];
-          console.log(`Sala ${roomId} removida (vazia)`);
+          console.log(`🗑️ Sala ${roomId} removida (vazia)`);
         }
       }
     }
@@ -478,13 +514,12 @@ function endRound(roomId) {
   clearTimeout(room.roundTimer);
 
   const arrivalOrder = Array.from(room.reachedFlagPlayers).sort((a, b) => {
-    // Assuming we track arrival time, but for simplicity, random order
     return Math.random() - 0.5;
   });
 
   const newPoints = {};
   arrivalOrder.forEach((id, index) => {
-    newPoints[id] = 10 - index; // First gets 10, second 9, etc.
+    newPoints[id] = 10 - index;
   });
 
   Object.keys(room.players).forEach((id) => {
@@ -503,7 +538,6 @@ function endRound(roomId) {
   }
 
   if (room.roundNumber >= 5) {
-    // Find winner with max points
     let maxPoints = 0;
     let winnerId = null;
     for (const id in room.players) {
@@ -523,7 +557,6 @@ function endRound(roomId) {
   room.placedItems = new Set();
   room.deadPlayers = new Set();
   room.reachedFlagPlayers = new Set();
-  // Reset positions if needed
 }
 
 function updateProjectiles(roomId) {
@@ -533,14 +566,12 @@ function updateProjectiles(roomId) {
   room.projectiles = room.projectiles
     .map((proj) => ({
       ...proj,
-      x: proj.x + proj.dir * 5, // Move arrow
+      x: proj.x + proj.dir * 5,
     }))
-    .filter((proj) => proj.x > 0 && proj.x < 2000); // Remove off-screen
+    .filter((proj) => proj.x > 0 && proj.x < 2000);
 
-  // Spawn new arrows from crossbows
   room.obstacles.forEach((obs) => {
     if (obs.type === "crossbow" && Math.random() < 0.1) {
-      // 10% chance per tick
       room.projectiles.push({
         id: Date.now() + "_" + Math.random(),
         x: obs.x + obs.width / 2,
@@ -556,4 +587,4 @@ function updateProjectiles(roomId) {
   io.to(roomId).emit("projectilesUpdate", room.projectiles);
 }
 
-server.listen(PORT, () => console.log("listening on", PORT));
+server.listen(PORT, () => console.log("🚀 Server listening on", PORT));
